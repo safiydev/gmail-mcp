@@ -8,7 +8,9 @@ from email.message import EmailMessage
 from email.header import decode_header
 from base64 import urlsafe_b64decode
 from email import message_from_bytes
+import urllib.parse
 import webbrowser
+import wsgiref.simple_server
 
 import mcp.types as types
 from mcp.server import Server
@@ -17,7 +19,7 @@ import mcp.server.stdio
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import InstalledAppFlow, _RedirectWSGIApp
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -198,6 +200,48 @@ class GmailService:
         self.user_email = self._get_user_email()
         logger.info(f"User email retrieved: {self.user_email}")
 
+    def _run_local_server(self, flow: InstalledAppFlow) -> Credentials:
+        """Run local redirect server honoring custom redirect_uri and handling headless environments."""
+        if self.redirect_uri:
+            parsed = urllib.parse.urlparse(self.redirect_uri)
+            host = parsed.hostname or "localhost"
+            listen_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        else:
+            host = "localhost"
+            listen_port = self.port
+
+        wsgi_app = _RedirectWSGIApp("Authentication successful! You can close this window.")
+        local_server = wsgiref.simple_server.make_server(
+            host,
+            listen_port,
+            wsgi_app,
+            handler_class=wsgiref.simple_server.WSGIRequestHandler
+        )
+
+        try:
+            if self.redirect_uri:
+                flow.redirect_uri = self.redirect_uri
+            else:
+                flow.redirect_uri = f"http://{host}:{local_server.server_port}/"
+
+            auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+
+            try:
+                webbrowser.get().open(auth_url, new=1, autoraise=True)
+            except webbrowser.Error as e:
+                logger.warning(f"Could not open browser automatically ({e}).")
+
+            logger.info(f"Please visit this URL to authorize this application: {auth_url}")
+            print(f"Please visit this URL to authorize this application: {auth_url}")
+
+            local_server.handle_request()
+            authorization_response = wsgi_app.last_request_uri.replace("http:", "https:", 1)
+            flow.fetch_token(authorization_response=authorization_response)
+        finally:
+            local_server.server_close()
+
+        return flow.credentials
+
     def _get_token(self) -> Credentials:
         """Get or refresh Google API token"""
 
@@ -213,19 +257,10 @@ class GmailService:
                 token.refresh(Request())
             else:
                 logger.info('Fetching new token')
-                if self.redirect_uri:
-                    flow = InstalledAppFlow.from_client_secrets_file(
-                        self.creds_file_path, self.scopes, redirect_uri=self.redirect_uri
-                    )
-                else:
-                    flow = InstalledAppFlow.from_client_secrets_file(
-                        self.creds_file_path, self.scopes
-                    )
-                try:
-                    token = flow.run_local_server(port=self.port)
-                except Exception as e:
-                    logger.warning(f"Could not open browser automatically ({e}). Falling back to manual URL display.")
-                    token = flow.run_local_server(port=self.port, open_browser=False)
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    self.creds_file_path, self.scopes
+                )
+                token = self._run_local_server(flow)
 
             with open(self.token_path, 'w') as token_file:
                 token_file.write(token.to_json())
